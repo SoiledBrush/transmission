@@ -1,0 +1,80 @@
+name: Publish LinuxServer Transmission PR 9103
+
+on:
+  push:
+    branches: [linuxserver-pr9103]
+    paths:
+      - .github/workflows/linuxserver-pr9103.yml
+      - dist/docker/linuxserver-pr9103.Dockerfile
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: linuxserver-pr9103
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/soiledbrush/transmission-linuxserver
+  SOURCE_REVISION: 43751110c224b8ca2f7b0b674267539a548ce613
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ env.SOURCE_REVISION }}
+          path: transmission-src
+          submodules: recursive
+          persist-credentials: false
+      - name: Build patched image
+        run: |
+          docker build \
+            --file dist/docker/linuxserver-pr9103.Dockerfile \
+            --build-arg "SOURCE_REVISION=$SOURCE_REVISION" \
+            --tag "$IMAGE:$GITHUB_RUN_ID-$ARCH" transmission-src
+      - name: Smoke test LinuxServer startup, web UI and legacy RPC
+        run: |
+          docker run -d --name transmission-smoke -p 127.0.0.1:19091:9091 \
+            -e PUID=1000 -e PGID=1000 -e TZ=Etc/UTC "$IMAGE:$GITHUB_RUN_ID-$ARCH"
+          trap 'docker logs transmission-smoke; docker rm -fv transmission-smoke' EXIT
+          curl --fail --silent --show-error --retry 30 --retry-delay 2 --retry-all-errors \
+            http://127.0.0.1:19091/transmission/web/ -o /dev/null
+          rpc=http://127.0.0.1:19091/transmission/rpc
+          session_id=$(curl -sS -D - -o /dev/null "$rpc" | awk 'tolower($1) == "x-transmission-session-id:" { gsub(/\r/, "", $2); print $2 }')
+          test -n "$session_id"
+          curl -fsS -H "X-Transmission-Session-Id: $session_id" \
+            -H 'Content-Type: application/json' --data '{"method":"session-get"}' "$rpc" \
+            | jq -e '.result == "success"'
+      - name: Push tested image
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE:$GITHUB_RUN_ID-$ARCH"
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Publish multi-platform tags
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker buildx imagetools create \
+            --tag "$IMAGE:latest" --tag "$IMAGE:pr-9103" \
+            "$IMAGE:$GITHUB_RUN_ID-amd64" "$IMAGE:$GITHUB_RUN_ID-arm64"
+          docker buildx imagetools inspect "$IMAGE:pr-9103"
